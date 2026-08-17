@@ -1,937 +1,366 @@
-import React, { useState, useMemo, useRef, useEffect, useCallback } from "react";
-import * as XLSX from "xlsx";
-import {
-  FileSpreadsheet,
-  Table2,
-  ChevronDown,
-  Plus,
-  Trash2,
-  RefreshCw,
-  Download,
-  Upload,
-  X,
-} from "lucide-react";
-
-// ---- 匯率換算輔助常數 --------------------------------------------------
-const RATE_BUFFER = 1.05; // 5% 緩衝
-
-// ---- Google Sheets API --------------------------------------------------
-const SHEETS_SPREADSHEET_ID = "15ZYaBbl2GqcbFWX0Z80d-ACbIeRUsmlTLPX59gAXIcc";
-const SHEETS_SHEET_NAME = "海關匯率對照表";
-const SHEETS_API_KEY = "AIzaSyA9PKE-v0xBhg-Up_s-TMRHrORy5oXO014";
-
-// ---- 歷史紀錄寫回 Google Sheet（Apps Script Web App，非 Sheets API）--------
-// Sheets API 的金鑰只能讀取、不能寫入，寫入一定要走有身分授權的管道，
-// 所以這裡改用部署好的 Apps Script Web App 網址。
-// 用 no-cors 送出：資料一定送得出去，但瀏覽器讀不到 Google 回傳的成功/失敗訊息，
-// 所以無法在畫面上顯示「雲端同步成功」，只能顯示「已送出」；
-// 真的要確認有沒有寫入成功，要直接打開 Google Sheet 的「採購歷史紀錄」分頁查看。
-const HISTORY_WRITE_URL = "https://script.google.com/macros/s/AKfycby4lJl8hfOa_6jjyrCDqgcq22cp8OEUkyO9kE8G16I0cfEBh05eHHFUCxQ3fFdBVwX-/exec";
-
-function writeHistoryToSheet(payload) {
-  // no-cors：不論成功與否都不會拋出 CORS 錯誤，也讀不到回應內容
-  return fetch(HISTORY_WRITE_URL, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
-  });
-}
-
-// 一次抓 B2(USD)、B3(CNY) 兩個儲存格，回傳 {USD, CNY}
-// 這樣切換幣別下拉選單時不用重打 API，直接讀已經抓好的值；
-// 幣別橋接（unitCostCurrency ≠ exchangeCurrency 時）也會用這組真實匯率，
-// 不再用寫死的假數字。
-async function fetchAllLiveRates() {
-  const range = encodeURIComponent(SHEETS_SHEET_NAME + "!B2:B3");
-  const url = "https://sheets.googleapis.com/v4/spreadsheets/" + SHEETS_SPREADSHEET_ID + "/values/" + range + "?key=" + encodeURIComponent(SHEETS_API_KEY);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Google Sheet 讀取失敗（請確認金鑰與 Sheet 分享權限）");
-  const data = await res.json();
-  const usd = parseFloat(data?.values?.[0]?.[0]);
-  const cny = parseFloat(data?.values?.[1]?.[0]);
-  if (!usd || !cny || isNaN(usd) || isNaN(cny)) throw new Error("Sheet 儲存格無有效數值");
-  return { USD: usd, CNY: cny };
-}
-
-// ---- Excel 資料結構模擬 (精簡版：移除單價與數量，加入預設幣別) ------------------
-const INITIAL_VENDOR_SHEET = [
-  {
-    vendor: "Mouser",
-    defaultCurrency: "USD",
-    freeShippingThreshold: 50,
-    shippingFee: 20,
-    handlingFeePercent: 0,
-    otherFee: 0,
-    formulaType: "STANDARD_THRESHOLD",
-  },
-  {
-    vendor: "DigiKey",
-    defaultCurrency: "USD",
-    freeShippingThreshold: 50,
-    shippingFee: 20,
-    handlingFeePercent: 0,
-    otherFee: 0,
-    formulaType: "STANDARD_THRESHOLD",
-  },
-  {
-    vendor: "LCSC",
-    defaultCurrency: "CNY",
-    freeShippingThreshold: 0,
-    shippingFee: 0,
-    handlingFeePercent: 3,
-    otherFee: 5,
-    formulaType: "PERCENTAGE_ONLY",
-  },
-  {
-    vendor: "Arrow",
-    defaultCurrency: "USD",
-    freeShippingThreshold: 100,
-    shippingFee: 25,
-    handlingFeePercent: 2.5,
-    otherFee: 10,
-    formulaType: "TIERED_QTY_DISCOUNT",
-  },
-];
-
-const COLUMN_META = [
-  { key: "vendor", label: "A · vendor" },
-  { key: "defaultCurrency", label: "B · defaultCurrency" },
-  { key: "freeShippingThreshold", label: "C · freeShippingThreshold" },
-  { key: "shippingFee", label: "D · shippingFee" },
-  { key: "handlingFeePercent", label: "E · handlingFeePercent" },
-  { key: "otherFee", label: "F · otherFee" },
-  { key: "formulaType", label: "G · formulaType" },
-];
-
-const REQUIRED_KEYS = COLUMN_META.map((c) => c.key);
-
-// ---- 格式化輔助 (使用字串連接法以確保編譯安全) -----------------------------
-const fmtUSD = (n) => {
-  const val = Number(n || 0);
-  return "$" + val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-};
-
-const fmtTWD = (n) => {
-  const val = Math.round(Number(n || 0));
-  return "NT$" + val.toLocaleString("en-US");
-};
-
-const fmtTWDUnit = (n) => {
-  // 將最終台幣單價無條件進位至小數點第二位
-  const val = Math.ceil(Number(n || 0) * 100) / 100;
-  return "NT$" + val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-};
-
-// ---- 幣別橋接：一律透過「真實抓到的匯率」換算，不再用寫死的假匯率 -----------
-function bridgeCurrency(amount, from, to, liveRates) {
-  if (from === to) return amount;
-  const fromRate = liveRates[from] ?? 1; // NTD 固定視為 1
-  const toRate = liveRates[to] ?? 1;
-  const twd = amount * fromRate;
-  return twd / toRate;
-}
-
-function computeQuote(row, { exchangeRate, exchangeCurrency, unitCost, unitCostCurrency, quantity, tariffRate, liveRates }) {
-  const unitCostUSD = bridgeCurrency(unitCost, unitCostCurrency, "USD", liveRates);
-  const subtotalUSD = unitCostUSD * quantity;
-
-  let shippingUSD = 0;
-  let handlingUSD = 0;
-  let trace = "";
-
-  switch (row.formulaType) {
-    case "STANDARD_THRESHOLD": {
-      const overThreshold = subtotalUSD >= row.freeShippingThreshold;
-      shippingUSD = overThreshold ? 0 : row.shippingFee;
-      handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
-      trace = "STANDARD_THRESHOLD → 小計 " + fmtUSD(subtotalUSD) + (overThreshold ? " ≥" : " <") + " 免運門檻 $" + row.freeShippingThreshold + " ⇒ 運費 " + fmtUSD(shippingUSD) + "；手續費 = 小計 × " + row.handlingFeePercent + "%";
-      break;
-    }
-    case "FLAT_HANDLING_NO_THRESHOLD": {
-      shippingUSD = row.shippingFee;
-      handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
-      trace = "FLAT_HANDLING_NO_THRESHOLD → 固定收運費 " + fmtUSD(shippingUSD) + "；手續費 = 小計 × " + row.handlingFeePercent + "%";
-      break;
-    }
-    case "PERCENTAGE_ONLY": {
-      shippingUSD = 0;
-      handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
-      trace = "PERCENTAGE_ONLY → 報價已含運費；僅收手續費 = 小計 × " + row.handlingFeePercent + "%";
-      break;
-    }
-    case "TIERED_QTY_DISCOUNT": {
-      const tierQty = row.freeShippingThreshold;
-      const overTier = quantity >= tierQty;
-      const effectiveRate = overTier ? row.handlingFeePercent / 2 : row.handlingFeePercent;
-      shippingUSD = row.shippingFee;
-      handlingUSD = (subtotalUSD * effectiveRate) / 100;
-      trace = "TIERED_QTY_DISCOUNT → 數量 " + quantity + (overTier ? " ≥" : " <") + " 級距門檻 " + tierQty + " ⇒ 手續費率 " + (overTier ? "減半為 " : "維持 ") + effectiveRate + "%；固定運費 " + fmtUSD(shippingUSD);
-      break;
-    }
-    default: {
-      const overThreshold = subtotalUSD >= row.freeShippingThreshold;
-      shippingUSD = overThreshold ? 0 : row.shippingFee;
-      handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
-      trace = "⚠ 未知的 formulaType，已退回 STANDARD_THRESHOLD 邏輯計算";
-    }
-  }
-
-  const feesUSD = handlingUSD + row.otherFee;
-  // 關稅計算：小計(USD) × 關稅率(%)
-  const tariffUSD = subtotalUSD * (Number(tariffRate) / 100);
-  
-  const totalUSD = subtotalUSD + shippingUSD + feesUSD + tariffUSD;
-  const totalForeign = bridgeCurrency(totalUSD, "USD", exchangeCurrency, liveRates);
-  const totalTWD = totalForeign * exchangeRate;
-
-  return { subtotalUSD, shippingUSD, feesUSD, tariffUSD, totalUSD, totalTWD, trace };
-}
-
-function vendorNeedsHandlingFee(row) {
-  return Number(row.handlingFeePercent) > 0 || Number(row.otherFee) > 0;
-}
-
-export default function ProcurementCalculator() {
-  const [vendorSheet, setVendorSheet] = useState(INITIAL_VENDOR_SHEET);
-  const [selectedVendor, setSelectedVendor] = useState(INITIAL_VENDOR_SHEET[0].vendor);
-  const [showSheetPreview, setShowSheetPreview] = useState(false);
-  const [importError, setImportError] = useState("");
-  const fileInputRef = useRef(null);
-
-  const activeRow = useMemo(
-    () => vendorSheet.find((r) => r.vendor === selectedVendor) || vendorSheet[0],
-    [vendorSheet, selectedVendor]
-  );
-
-  const [exchangeCurrency, setExchangeCurrency] = useState(activeRow.defaultCurrency);
-  const [exchangeRate, setExchangeRate] = useState(0); // 初始為 0，等待抓取
-  const [liveRates, setLiveRates] = useState({ USD: null, CNY: null, NTD: 1 });
-  const [unitCostCurrency, setUnitCostCurrency] = useState(activeRow.defaultCurrency);
-  const [unitCost, setUnitCost] = useState(""); // 改為空字串，待輸入
-  const [quantity, setQuantity] = useState(1); // 預設為 1
-  const [history, setHistory] = useState([]);
-
-  // ---- 匯率處理狀態 ----
-  const [rateLoading, setRateLoading] = useState(false);
-  const [rateError, setRateError] = useState("");
-  const [rateUpdatedAt, setRateUpdatedAt] = useState(null);
-  const [rateSource, setRateSource] = useState("");
-
-  // 一次抓 USD、CNY 兩種即時匯率存起來；之後切換幣別直接讀，不重打 API
-  const refreshLiveRates = useCallback(async (applyToCurrency) => {
-    setRateLoading(true);
-    setRateError("");
-    try {
-      const raw = await fetchAllLiveRates();
-      const buffered = {
-        USD: Number((raw.USD * RATE_BUFFER).toFixed(4)),
-        CNY: Number((raw.CNY * RATE_BUFFER).toFixed(4)),
-        NTD: 1,
-      };
-      setLiveRates(buffered);
-      setRateUpdatedAt(new Date().toLocaleString("zh-TW", { hour12: false }));
-      setRateSource("Google Sheet (+5% 緩衝)");
-      if (applyToCurrency) setExchangeRate(buffered[applyToCurrency] ?? 0);
-    } catch (err) {
-      setRateError("匯率抓取失敗，請確認網路或 API");
-    } finally {
-      setRateLoading(false);
-    }
-  }, []);
-
-  // 只在載入時抓一次；之後靠「強制更新最新匯率」按鈕手動刷新，
-  // 切換廠商／幣別不會再重打 API
-  useEffect(() => {
-    refreshLiveRates(exchangeCurrency);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 切換「計價匯率」幣別：直接讀已經抓好的 liveRates，不重打 API
-  function handleExchangeCurrencyChange(newCurrency) {
-    setExchangeCurrency(newCurrency);
-    setExchangeRate(liveRates[newCurrency] ?? 0);
-  }
-
-  function handleVendorChange(vendorName) {
-    const row = vendorSheet.find((r) => r.vendor === vendorName);
-    if (!row) return;
-    setSelectedVendor(vendorName);
-    
-    // 切換廠商時：清空單價、設定預設數量、切換至該廠商預設幣別
-    handleExchangeCurrencyChange(row.defaultCurrency);
-    setUnitCostCurrency(row.defaultCurrency);
-    setUnitCost("");
-    setQuantity(1);
-  }
-
-  // ---- 料號分類 → 關稅率估算（Mouser Search API）--------------------------
-  const [mouserApiKey, setMouserApiKey] = useState("");
-  const [showApiKeyInput, setShowApiKeyInput] = useState(false);
-  const [partNumber, setPartNumber] = useState("");
-  const [tariffLookupLoading, setTariffLookupLoading] = useState(false);
-  const [tariffLookupError, setTariffLookupError] = useState("");
-  const [tariffResult, setTariffResult] = useState(null); 
-  const [manualTariffRate, setManualTariffRate] = useState(0); 
-
-  const TARIFF_CATEGORY_RULES = [
-    { keyword: "RELAY", rate: 5 },
-    { keyword: "FUSE", rate: 5 },
-  ];
-
-  function classifyCategoryText(text) {
-    const upper = (text || "").toUpperCase();
-    const hit = TARIFF_CATEGORY_RULES.find((r) => upper.includes(r.keyword));
-    return hit ? hit.rate : 0;
-  }
-
-  async function handleLookupTariff() {
-    if (!partNumber.trim()) return;
-    setTariffLookupLoading(true);
-    setTariffLookupError("");
-    setTariffResult(null);
-
-    if (!mouserApiKey.trim()) {
-      const rate = classifyCategoryText(partNumber);
-      setTariffResult({ category: null, rate, source: "本地比對（未設定 API 金鑰）" });
-      setManualTariffRate(rate); // 自動填入欄位
-      setTariffLookupLoading(false);
-      return;
-    }
-
-    try {
-      const res = await fetch("https://api.mouser.com/api/v1/search/keyword?apiKey=" + encodeURIComponent(mouserApiKey), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          SearchByKeywordRequest: { keyword: partNumber.trim(), records: 1, startingRecord: 0 },
-        }),
-      });
-      if (!res.ok) throw new Error("Mouser API 連線失敗");
-      const data = await res.json();
-      const part = data?.SearchResults?.Parts?.[0];
-      
-      if (!part) {
-        const rate = classifyCategoryText(partNumber);
-        setTariffResult({ category: null, rate, source: "Mouser 查無此料號，改用本地比對" });
-        setManualTariffRate(rate);
-      } else {
-        const category = part.Category || "";
-        const rate = classifyCategoryText(category);
-        setTariffResult({ category, rate, source: "Mouser Search API" });
-        setManualTariffRate(rate);
-      }
-    } catch (err) {
-      const rate = classifyCategoryText(partNumber);
-      setTariffResult({ category: null, rate, source: "⚠ API 失敗，已改用本地比對" });
-      setTariffLookupError("Mouser API 呼叫失敗，可能為跨網域(CORS)限制或金鑰錯誤");
-      setManualTariffRate(rate);
-    } finally {
-      setTariffLookupLoading(false);
-    }
-  }
-
-  const quote = useMemo(
-    () =>
-      computeQuote(activeRow, {
-        exchangeRate: Number(exchangeRate) || 0,
-        exchangeCurrency,
-        unitCost: Number(unitCost) || 0,
-        unitCostCurrency,
-        quantity: Number(quantity) || 0,
-        tariffRate: Number(manualTariffRate) || 0,
-        liveRates,
-      }),
-    [activeRow, exchangeRate, exchangeCurrency, unitCost, unitCostCurrency, quantity, manualTariffRate, liveRates]
-  );
-
-  const hasHandlingFee = vendorNeedsHandlingFee(activeRow);
-  const qtyNum = Number(quantity) || 0;
-  const finalUnitCostTWD = qtyNum > 0 ? quote.totalTWD / qtyNum : null;
-
-  const [cloudWriteSentAt, setCloudWriteSentAt] = useState(null);
-
-  function handleAddHistory() {
-    const finalUnitCostTWDValue = qtyNum > 0 ? quote.totalTWD / qtyNum : null;
-    const entry = {
-      id: Date.now(),
-      vendor: activeRow.vendor,
-      formulaType: activeRow.formulaType,
-      exchangeRate: Number(exchangeRate),
-      exchangeCurrency,
-      unitCost: Number(unitCost),
-      unitCostCurrency,
-      quantity: Number(quantity),
-      tariffRate: Number(manualTariffRate),
-      ...quote,
-      finalUnitCostTWD: finalUnitCostTWDValue,
-      timestamp: new Date().toLocaleString("zh-TW", { hour12: false }),
-    };
-
-    setHistory((h) => [entry, ...h]);
-
-    // 同時寫回 Google Sheet（不影響本機畫面上的表格，失敗也不會擋住 UI）
-    writeHistoryToSheet(entry)
-      .then(() => setCloudWriteSentAt(new Date().toLocaleString("zh-TW", { hour12: false })))
-      .catch(() => {
-        // no-cors 模式下幾乎不會走到這裡（不會拋出 CORS 錯誤），
-        // 只有網路完全斷線之類的情況才會進來
-      });
-  }
-
-  function handleDeleteHistory(id) {
-    setHistory((h) => h.filter((r) => r.id !== id));
-  }
-
-  function handleImportClick() {
-    setImportError("");
-    fileInputRef.current?.click();
-  }
-
-  function handleFileSelected(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const wb = XLSX.read(evt.target.result, { type: "binary" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: 0 });
-        if (!rows.length || !REQUIRED_KEYS.every((k) => k in rows[0])) {
-          setImportError("匯入失敗：表頭欄位需完全對應 " + REQUIRED_KEYS.join(", "));
-          return;
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>採購成本試算台 - 良興</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- SheetJS (xlsx) -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0A0F1C;
+            background-image: linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+            background-size: 28px 28px;
+            color: #E9EDF7;
+            min-height: 100vh;
         }
-        setVendorSheet(rows);
-        setSelectedVendor(rows[0].vendor);
-        setExchangeCurrency(rows[0].defaultCurrency);
-        setUnitCostCurrency(rows[0].defaultCurrency);
-        setImportError("");
-        setShowSheetPreview(true);
-      } catch (err) {
-        setImportError("匯入失敗：檔案格式無法解析，請確認為 .xlsx");
-      }
-    };
-    reader.readAsBinaryString(file);
-    e.target.value = "";
-  }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .font-grotesk { font-family: 'Space Grotesk', sans-serif; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
 
-  function handleExportSheet() {
-    const ws = XLSX.utils.json_to_sheet(vendorSheet, { header: REQUIRED_KEYS });
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "廠商規則");
-    XLSX.writeFile(wb, "vendor-rules.xlsx");
-  }
+    <script type="text/babel">
+        const { useState, useMemo, useRef, useEffect, useCallback } = React;
+        
+        const RATE_BUFFER = 1.05;
+        const SHEETS_SPREADSHEET_ID = "15ZYaBbl2GqcbFWX0Z80d-ACbIeRUsmlTLPX59gAXIcc";
+        const SHEETS_SHEET_NAME = "海關匯率對照表";
+        const SHEETS_API_KEY = "AIzaSyA9PKE-v0xBhg-Up_s-TMRHrORy5oXO014";
+        const HISTORY_WRITE_URL = "https://script.google.com/macros/s/AKfycby4lJl8hfOa_6jjyrCDqgcq22cp8OEUkyO9kE8G16I0cfEBh05eHHFUCxQ3fFdBVwX-/exec";
 
-  function handleExportHistory() {
-    if (history.length === 0) return;
-    
-    // 整理輸出的 Excel 欄位
-    const exportData = history.map((r) => ({
-      時間: r.timestamp,
-      廠商: r.vendor,
-      計價幣別: r.exchangeCurrency,
-      匯率: r.exchangeRate,
-      單價幣別: r.unitCostCurrency,
-      輸入單價: r.unitCost,
-      採購數量: r.quantity,
-      "小計(USD)": Number(r.subtotalUSD.toFixed(2)),
-      "運費(USD)": Number(r.shippingUSD.toFixed(2)),
-      "手續等費用(USD)": Number(r.feesUSD.toFixed(2)),
-      "關稅率(%)": r.tariffRate,
-      "關稅金額(USD)": Number(r.tariffUSD.toFixed(2)),
-      "總成本(TWD)": Math.round(r.totalTWD),
-      "最終單位成本(TWD)": Number((Math.ceil((r.totalTWD / r.quantity) * 100) / 100).toFixed(2))
-    }));
-
-    const ws = XLSX.utils.json_to_sheet(exportData);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "採購歷史紀錄");
-    XLSX.writeFile(wb, "procurement-history.xlsx");
-  }
-
-  return (
-    <div className="app">
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
-        * { box-sizing: border-box; }
-        .app {
-          --ink: #0A0F1C;
-          --panel: #121A2C;
-          --panel-raised: #1A2438;
-          --border: #29344E;
-          --text: #E9EDF7;
-          --text-dim: #8592B0;
-          --gold: #E3B341;
-          --teal: #3BD6A0;
-          --coral: #F0725A;
-          font-family: 'Inter', sans-serif;
-          background: var(--ink);
-          background-image:
-            linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
-          background-size: 28px 28px;
-          color: var(--text);
-          min-height: 100vh;
-          padding: 32px 20px 64px;
-        }
-        .shell { max-width: 1080px; margin: 0 auto; }
-        .masthead { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
-        .masthead h1 {
-          font-family: 'Space Grotesk', sans-serif;
-          font-size: 26px; font-weight: 700; margin: 0; letter-spacing: -0.01em;
-        }
-        .masthead .eyebrow {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 12px; color: var(--text-dim); letter-spacing: 0.06em; text-transform: uppercase;
-          display: block; margin-bottom: 6px;
+        function writeHistoryToSheet(payload) {
+            return fetch(HISTORY_WRITE_URL, {
+                method: "POST",
+                mode: "no-cors",
+                headers: { "Content-Type": "text/plain;charset=utf-8" },
+                body: JSON.stringify(payload),
+            });
         }
 
-        .card {
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 14px;
-          padding: 20px;
-          margin-bottom: 20px;
-        }
-        .card-title {
-          font-family: 'Space Grotesk', sans-serif;
-          font-size: 15px; font-weight: 600; margin: 0 0 14px;
-          display: flex; align-items: center; gap: 8px;
-        }
-
-        .import-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
-        .btn {
-          font-family: 'Inter', sans-serif; font-weight: 600; font-size: 13.5px;
-          border-radius: 9px; padding: 10px 16px; cursor: pointer; border: 1px solid var(--border);
-          display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease;
-        }
-        .btn-primary { background: var(--gold); color: #241C08; border-color: var(--gold); }
-        .btn-primary:hover { filter: brightness(1.08); }
-        .btn-ghost { background: transparent; color: var(--text); }
-        .btn-ghost:hover { background: var(--panel-raised); }
-        .btn-sm { padding: 7px 12px; font-size: 12.5px; }
-        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
-
-        .error-banner {
-          margin-top: 12px; padding: 10px 14px; border-radius: 9px;
-          background: rgba(240,114,90,0.12); border: 1px solid rgba(240,114,90,0.4);
-          color: var(--coral); font-size: 13px; font-family: 'JetBrains Mono', monospace;
+        async function fetchAllLiveRates() {
+            const range = encodeURIComponent(SHEETS_SHEET_NAME + "!B2:B3");
+            const url = "https://sheets.googleapis.com/v4/spreadsheets/" + SHEETS_SPREADSHEET_ID + "/values/" + range + "?key=" + encodeURIComponent(SHEETS_API_KEY);
+            const res = await fetch(url);
+            if (!res.ok) throw new Error("Google Sheet 讀取失敗");
+            const data = await res.json();
+            const usd = parseFloat(data?.values?.[0]?.[0]);
+            const cny = parseFloat(data?.values?.[1]?.[0]);
+            if (!usd || !cny || isNaN(usd) || isNaN(cny)) throw new Error("Sheet 儲存格無有效數值");
+            return { USD: usd, CNY: cny };
         }
 
-        .sheet-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
-        .sheet-table th, .sheet-table td { padding: 9px 10px; border: 1px solid var(--border); text-align: left; white-space: nowrap; }
-        .sheet-table thead tr:first-child th { background: var(--panel-raised); color: var(--gold); font-weight: 600; }
-        .sheet-table thead tr:last-child th { color: var(--text-dim); font-weight: 500; }
-        .sheet-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
-        .sheet-table tbody tr:hover { background: rgba(227,179,65,0.06); }
+        const INITIAL_VENDOR_SHEET = [
+            { vendor: "Mouser", defaultCurrency: "USD", freeShippingThreshold: 50, shippingFee: 20, handlingFeePercent: 0, otherFee: 0, formulaType: "STANDARD_THRESHOLD" },
+            { vendor: "DigiKey", defaultCurrency: "USD", freeShippingThreshold: 50, shippingFee: 20, handlingFeePercent: 0, otherFee: 0, formulaType: "STANDARD_THRESHOLD" },
+            { vendor: "LCSC", defaultCurrency: "CNY", freeShippingThreshold: 0, shippingFee: 0, handlingFeePercent: 3, otherFee: 5, formulaType: "PERCENTAGE_ONLY" },
+            { vendor: "Arrow", defaultCurrency: "USD", freeShippingThreshold: 100, shippingFee: 25, handlingFeePercent: 2.5, otherFee: 10, formulaType: "TIERED_QTY_DISCOUNT" }
+        ];
 
-        .controls-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-          gap: 16px;
-          align-items: end;
-        }
-        .field label {
-          display: block; font-size: 11.5px; color: var(--text-dim);
-          font-family: 'JetBrains Mono', monospace; letter-spacing: 0.04em;
-          text-transform: uppercase; margin-bottom: 7px;
-        }
-        .field-combo { display: flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: var(--panel-raised); }
-        .field-combo select, .field-combo input, select.select-solo, input.input-solo {
-          background: transparent; border: none; color: var(--text);
-          font-family: 'JetBrains Mono', monospace; font-size: 14px; padding: 10px;
-          outline: none; width: 100%;
-        }
-        select.select-solo, input.input-solo {
-          border: 1px solid var(--border); border-radius: 9px; background: var(--panel-raised);
-        }
-        .field-combo select { flex: 0 0 74px; border-right: 1px solid var(--border); cursor: pointer; }
-        .field-combo input { flex: 1; min-width: 0; }
-        .rate-refresh {
-          margin-top: 8px; display: flex; align-items: center; gap: 6px;
-          font-size: 11.5px; color: var(--teal); cursor: pointer; background: none; border: none;
-          font-family: 'JetBrains Mono', monospace; padding: 0;
-        }
-        .rate-refresh:hover { text-decoration: underline; }
-        .rate-refresh:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
-        .rate-refresh .spin { animation: spin 0.8s linear infinite; }
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .rate-error { margin-top: 6px; font-size: 11.5px; color: var(--coral); font-family: 'JetBrains Mono', monospace; }
-        .rate-meta { margin-top: 6px; font-size: 11px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; }
+        const COLUMN_META = [
+            { key: "vendor", label: "A · vendor" },
+            { key: "defaultCurrency", label: "B · defaultCurrency" },
+            { key: "freeShippingThreshold", label: "C · freeShippingThreshold" },
+            { key: "shippingFee", label: "D · shippingFee" },
+            { key: "handlingFeePercent", label: "E · handlingFeePercent" },
+            { key: "otherFee", label: "F · otherFee" },
+            { key: "formulaType", label: "G · formulaType" }
+        ];
+        const REQUIRED_KEYS = COLUMN_META.map(c => c.key);
 
-        .add-history-btn { width: 100%; justify-content: center; margin-top: 4px; }
+        const fmtUSD = (n) => "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const fmtTWD = (n) => "NT$" + Math.round(Number(n || 0)).toLocaleString("en-US");
+        const fmtTWDUnit = (n) => {
+            const val = Math.ceil(Number(n || 0) * 100) / 100;
+            return "NT$" + val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        };
 
-        .panel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
-        .stat {
-          background: var(--panel-raised); border: 1px solid var(--border); border-radius: 12px;
-          padding: 18px;
-        }
-        .stat .stat-label { font-size: 11.5px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
-        .stat .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 600; }
-        .stat.total { background: linear-gradient(145deg, rgba(227,179,65,0.14), rgba(227,179,65,0.03)); border-color: rgba(227,179,65,0.5); }
-        .stat.total .stat-value { color: var(--gold); font-size: 28px; }
-        .stat.ship .stat-value { color: var(--teal); }
-
-        .trace-strip {
-          margin-top: 16px; position: relative;
-          background: #0D1424; border: 1px dashed var(--border); border-radius: 10px;
-          padding: 12px 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px;
-          color: var(--teal); line-height: 1.6; word-break: break-word;
-        }
-        .trace-strip .trace-tag {
-          color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 8px;
+        function bridgeCurrency(amount, from, to, liveRates) {
+            if (from === to) return amount;
+            const fromRate = liveRates[from] ?? 1;
+            const toRate = liveRates[to] ?? 1;
+            return (amount * fromRate) / toRate;
         }
 
-        .history-table-wrap { overflow-x: auto; }
-        table.history { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 900px; }
-        table.history th { text-align: left; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-weight: 500; }
-        table.history td { padding: 11px 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; }
-        table.history tbody tr:hover { background: var(--panel-raised); }
-        table.history td.total-cell { color: var(--gold); font-weight: 600; }
-        .del-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 4px; border-radius: 6px; }
-        .del-btn:hover { color: var(--coral); background: rgba(240,114,90,0.1); }
-        .empty-state { text-align: center; padding: 36px 12px; color: var(--text-dim); font-size: 13.5px; }
+        function computeQuote(row, { exchangeRate, exchangeCurrency, unitCost, unitCostCurrency, quantity, tariffRate, liveRates }) {
+            const unitCostUSD = bridgeCurrency(unitCost, unitCostCurrency, "USD", liveRates);
+            const subtotalUSD = unitCostUSD * quantity;
+            let shippingUSD = 0;
+            let handlingUSD = 0;
+            let trace = "";
 
-        @media (max-width: 640px) {
-          .masthead h1 { font-size: 21px; }
-          .stat.total .stat-value { font-size: 24px; }
+            switch (row.formulaType) {
+                case "STANDARD_THRESHOLD":
+                    const overThreshold = subtotalUSD >= row.freeShippingThreshold;
+                    shippingUSD = overThreshold ? 0 : row.shippingFee;
+                    handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
+                    trace = `STANDARD_THRESHOLD → 小計 ${fmtUSD(subtotalUSD)} ${overThreshold ? "≥" : "<"} 免運門檻 $${row.freeShippingThreshold} ⇒ 運費 ${fmtUSD(shippingUSD)}`;
+                    break;
+                case "FLAT_HANDLING_NO_THRESHOLD":
+                    shippingUSD = row.shippingFee;
+                    handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
+                    trace = `FLAT_HANDLING_NO_THRESHOLD → 固定運費 ${fmtUSD(shippingUSD)}`;
+                    break;
+                case "PERCENTAGE_ONLY":
+                    shippingUSD = 0;
+                    handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
+                    trace = `PERCENTAGE_ONLY → 報價已含運費`;
+                    break;
+                case "TIERED_QTY_DISCOUNT":
+                    const tierQty = row.freeShippingThreshold;
+                    const overTier = quantity >= tierQty;
+                    const effectiveRate = overTier ? row.handlingFeePercent / 2 : row.handlingFeePercent;
+                    shippingUSD = row.shippingFee;
+                    handlingUSD = (subtotalUSD * effectiveRate) / 100;
+                    trace = `TIERED_QTY_DISCOUNT → 數量 ${quantity} ${overTier ? "≥" : "<"} 級距門檻 ${tierQty}`;
+                    break;
+                default:
+                    shippingUSD = subtotalUSD >= row.freeShippingThreshold ? 0 : row.shippingFee;
+                    handlingUSD = (subtotalUSD * row.handlingFeePercent) / 100;
+                    trace = `預設計算邏輯`;
+            }
+
+            const feesUSD = handlingUSD + row.otherFee;
+            const tariffUSD = subtotalUSD * (Number(tariffRate) / 100);
+            const totalUSD = subtotalUSD + shippingUSD + feesUSD + tariffUSD;
+            const totalForeign = bridgeCurrency(totalUSD, "USD", exchangeCurrency, liveRates);
+            const totalTWD = totalForeign * exchangeRate;
+
+            return { subtotalUSD, shippingUSD, feesUSD, tariffUSD, totalUSD, totalTWD, trace };
         }
-      `}</style>
 
-      <div className="shell">
-        <header className="masthead">
-          <div>
-            <span className="eyebrow">Excel 驅動型 · 跨境零件採購成本引擎</span>
-            <h1>採購成本試算台</h1>
-          </div>
-        </header>
+        function App() {
+            const [vendorSheet, setVendorSheet] = useState(INITIAL_VENDOR_SHEET);
+            const [selectedVendor, setSelectedVendor] = useState(INITIAL_VENDOR_SHEET[0].vendor);
+            const [showSheetPreview, setShowSheetPreview] = useState(false);
+            const fileInputRef = useRef(null);
 
-        {/* 匯入 / 預覽區 */}
-        <section className="card">
-          <div className="import-row">
-            <div className="card-title" style={{ marginBottom: 0 }}>
-              <FileSpreadsheet size={17} color="var(--gold)" />
-              廠商 Excel 設定表 (精簡版)
-            </div>
-            <div className="btn-group">
-              <button className="btn btn-primary btn-sm" onClick={handleImportClick}>
-                <Upload size={14} /> 匯入規則設定
-              </button>
-              <button className="btn btn-ghost btn-sm" onClick={handleExportSheet}>
-                <Download size={14} /> 匯出標準格式
-              </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => setShowSheetPreview((s) => !s)}>
-                <Table2 size={14} />
-                {showSheetPreview ? "隱藏後台資料" : "檢視後台資料"}
-                <ChevronDown
-                  size={14}
-                  style={{ transform: showSheetPreview ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}
-                />
-              </button>
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls"
-              style={{ display: "none" }}
-              onChange={handleFileSelected}
-            />
-          </div>
+            const activeRow = useMemo(() => vendorSheet.find(r => r.vendor === selectedVendor) || vendorSheet[0], [vendorSheet, selectedVendor]);
+            
+            const [exchangeCurrency, setExchangeCurrency] = useState(activeRow.defaultCurrency);
+            const [exchangeRate, setExchangeRate] = useState(0);
+            const [liveRates, setLiveRates] = useState({ USD: null, CNY: null, NTD: 1 });
+            const [unitCostCurrency, setUnitCostCurrency] = useState(activeRow.defaultCurrency);
+            const [unitCost, setUnitCost] = useState("");
+            const [quantity, setQuantity] = useState(1);
+            const [history, setHistory] = useState([]);
+            const [manualTariffRate, setManualTariffRate] = useState(0);
+            const [rateLoading, setRateLoading] = useState(false);
+            const [rateError, setRateError] = useState("");
+            const [rateUpdatedAt, setRateUpdatedAt] = useState(null);
 
-          {importError && (
-            <div className="error-banner">
-              <X size={13} style={{ verticalAlign: "-2px", marginRight: 6 }} />
-              {importError}
-            </div>
-          )}
+            const refreshLiveRates = useCallback(async (applyToCurrency) => {
+                setRateLoading(true);
+                setRateError("");
+                try {
+                    const raw = await fetchAllLiveRates();
+                    const buffered = {
+                        USD: Number((raw.USD * RATE_BUFFER).toFixed(4)),
+                        CNY: Number((raw.CNY * RATE_BUFFER).toFixed(4)),
+                        NTD: 1,
+                    };
+                    setLiveRates(buffered);
+                    setRateUpdatedAt(new Date().toLocaleString("zh-TW", { hour12: false }));
+                    if (applyToCurrency) setExchangeRate(buffered[applyToCurrency] ?? 0);
+                } catch (err) {
+                    setRateError("匯率抓取失敗");
+                } finally {
+                    setRateLoading(false);
+                }
+            }, []);
 
-          {showSheetPreview && (
-            <table className="sheet-table">
-              <thead>
-                <tr>
-                  {COLUMN_META.map((c) => (
-                    <th key={c.key}>{c.label.split(" · ")[0]}</th>
-                  ))}
-                </tr>
-                <tr>
-                  {COLUMN_META.map((c) => (
-                    <th key={c.key}>{c.label.split(" · ")[1]}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {vendorSheet.map((row, i) => (
-                  <tr key={i}>
-                    {COLUMN_META.map((c) => (
-                      <td key={c.key}>{String(row[c.key])}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </section>
+            useEffect(() => {
+                refreshLiveRates(exchangeCurrency);
+            }, []);
 
-        {/* 控制區 */}
-        <section className="card">
-          <div className="card-title">試算變數</div>
-          <div className="controls-grid">
-            <div className="field">
-              <label>廠商</label>
-              <select
-                className="select-solo"
-                value={selectedVendor}
-                onChange={(e) => handleVendorChange(e.target.value)}
-              >
-                {vendorSheet.map((r) => (
-                  <option key={r.vendor} value={r.vendor}>
-                    {r.vendor}
-                  </option>
-                ))}
-              </select>
-            </div>
+            function handleExchangeCurrencyChange(newCurrency) {
+                setExchangeCurrency(newCurrency);
+                setExchangeRate(liveRates[newCurrency] ?? 0);
+            }
 
-            <div className="field">
-              <label>計價匯率</label>
-              <div className="field-combo">
-                <select value={exchangeCurrency} onChange={(e) => handleExchangeCurrencyChange(e.target.value)}>
-                  <option value="USD">USD</option>
-                  <option value="CNY">CNY</option>
-                  <option value="NTD">NTD</option>
-                </select>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={exchangeRate}
-                  onChange={(e) => setExchangeRate(e.target.value)}
-                />
-              </div>
-              <button 
-                className="rate-refresh" 
-                onClick={() => refreshLiveRates(exchangeCurrency)} 
-                disabled={rateLoading}
-              >
-                <RefreshCw size={12} className={rateLoading ? "spin" : ""} />
-                {rateLoading ? "抓取中…" : "強制更新最新匯率"}
-              </button>
-              {rateError && <div className="rate-error">{rateError}</div>}
-              {rateUpdatedAt && !rateError && (
-                <div className="rate-meta">
-                  自動更新於 {rateUpdatedAt}<br/>來源：{rateSource}
+            function handleVendorChange(vendorName) {
+                const row = vendorSheet.find(r => r.vendor === vendorName);
+                if (!row) return;
+                setSelectedVendor(vendorName);
+                handleExchangeCurrencyChange(row.defaultCurrency);
+                setUnitCostCurrency(row.defaultCurrency);
+                setUnitCost("");
+                setQuantity(1);
+            }
+
+            const quote = useMemo(() => computeQuote(activeRow, {
+                exchangeRate: Number(exchangeRate) || 0,
+                exchangeCurrency,
+                unitCost: Number(unitCost) || 0,
+                unitCostCurrency,
+                quantity: Number(quantity) || 0,
+                tariffRate: Number(manualTariffRate) || 0,
+                liveRates,
+            }), [activeRow, exchangeRate, exchangeCurrency, unitCost, unitCostCurrency, quantity, manualTariffRate, liveRates]);
+
+            const qtyNum = Number(quantity) || 0;
+            const finalUnitCostTWD = qtyNum > 0 ? quote.totalTWD / qtyNum : null;
+
+            function handleAddHistory() {
+                const entry = {
+                    id: Date.now(),
+                    vendor: activeRow.vendor,
+                    exchangeRate: Number(exchangeRate),
+                    exchangeCurrency,
+                    unitCost: Number(unitCost),
+                    unitCostCurrency,
+                    quantity: Number(quantity),
+                    tariffRate: Number(manualTariffRate),
+                    ...quote,
+                    timestamp: new Date().toLocaleString("zh-TW", { hour12: false }),
+                };
+                setHistory(h => [entry, ...h]);
+                writeHistoryToSheet(entry);
+            }
+
+            return (
+                <div className="max-w-6xl mx-auto p-4 sm:p-8">
+                    <header className="mb-6 flex justify-between items-baseline">
+                        <div>
+                            <span className="text-xs font-mono text-slate-400 uppercase tracking-wider">Excel 驅動型 · 跨境零件採購成本引擎</span>
+                            <h1 className="text-2xl font-bold font-grotesk mt-1">採購成本試算台</h1>
+                        </div>
+                    </header>
+
+                    {/* 控制區 */}
+                    <div className="bg-[#121A2C] border border-[#29344E] rounded-2xl p-6 mb-6 shadow-xl">
+                        <h2 className="text-base font-semibold font-grotesk mb-4 text-[#E3B341]">試算變數</h2>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div>
+                                <label className="block text-xs font-mono text-slate-400 uppercase mb-2">廠商</label>
+                                <select className="w-full bg-[#1A2438] border border-[#29344E] rounded-xl p-3 text-sm font-mono text-white outline-none" value={selectedVendor} onChange={(e) => handleVendorChange(e.target.value)}>
+                                    {vendorSheet.map(r => <option key={r.vendor} value={r.vendor}>{r.vendor}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-mono text-slate-400 uppercase mb-2">計價匯率 ({exchangeCurrency})</label>
+                                <div className="flex bg-[#1A2438] border border-[#29344E] rounded-xl overflow-hidden">
+                                    <select className="bg-transparent border-r border-[#29344E] p-3 text-sm font-mono text-white outline-none" value={exchangeCurrency} onChange={(e) => handleExchangeCurrencyChange(e.target.value)}>
+                                        <option value="USD">USD</option>
+                                        <option value="CNY">CNY</option>
+                                        <option value="NTD">NTD</option>
+                                    </select>
+                                    <input className="w-full bg-transparent p-3 text-sm font-mono text-white outline-none" type="number" step="0.01" value={exchangeRate} onChange={(e) => setExchangeRate(e.target.value)} />
+                                </div>
+                                <button className="mt-2 text-xs font-mono text-[#3BD6A0] hover:underline flex items-center gap-1" onClick={() => refreshLiveRates(exchangeCurrency)} disabled={rateLoading}>
+                                    {rateLoading ? "更新中..." : "↻ 強制更新最新匯率"}
+                                </button>
+                                {rateUpdatedAt && <div className="text-[10px] text-slate-500 font-mono mt-1">更新於 {rateUpdatedAt} (含5%緩衝)</div>}
+                            </div>
+                            <div>
+                                <label className="block text-xs font-mono text-slate-400 uppercase mb-2">單位成本</label>
+                                <div className="flex bg-[#1A2438] border border-[#29344E] rounded-xl overflow-hidden">
+                                    <select className="bg-transparent border-r border-[#29344E] p-3 text-sm font-mono text-white outline-none" value={unitCostCurrency} onChange={(e) => setUnitCostCurrency(e.target.value)}>
+                                        <option value="USD">USD</option>
+                                        <option value="CNY">CNY</option>
+                                        <option value="NTD">NTD</option>
+                                    </select>
+                                    <input className="w-full bg-transparent p-3 text-sm font-mono text-white outline-none" type="number" step="0.01" value={unitCost} onChange={(e) => setUnitCost(e.target.value)} placeholder="輸入單價" />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-mono text-slate-400 uppercase mb-2">採購數量</label>
+                                <input className="w-full bg-[#1A2438] border border-[#29344E] rounded-xl p-3 text-sm font-mono text-white outline-none" type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
+                            </div>
+                        </div>
+                        <div className="mt-4 flex gap-4 items-center">
+                            <div className="w-48">
+                                <label className="block text-xs font-mono text-slate-400 uppercase mb-2">關稅率 (%)</label>
+                                <input className="w-full bg-[#1A2438] border border-[#29344E] rounded-xl p-3 text-sm font-mono text-white outline-none" type="number" step="0.1" value={manualTariffRate} onChange={(e) => setManualTariffRate(e.target.value)} />
+                            </div>
+                            <div className="flex-1 pt-6">
+                                <button className="w-full bg-[#E3B341] text-[#241C08] font-bold py-3 px-6 rounded-xl hover:brightness-105 transition shadow-lg" onClick={handleAddHistory}>
+                                    + 加入歷史紀錄
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 數據面板 */}
+                    <div className="bg-[#121A2C] border border-[#29344E] rounded-2xl p-6 mb-6 shadow-xl">
+                        <h2 className="text-base font-semibold font-grotesk mb-4 text-[#E3B341]">試算結果</h2>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div className="bg-[#1A2438] border border-[#29344E] rounded-xl p-4">
+                                <div className="text-xs font-mono text-slate-400 uppercase mb-1">預估運費 (USD)</div>
+                                <div className="text-xl font-mono text-[#3BD6A0] font-bold">{fmtUSD(quote.shippingUSD)}</div>
+                            </div>
+                            <div className="bg-[#1A2438] border border-[#29344E] rounded-xl p-4">
+                                <div className="text-xs font-mono text-slate-400 uppercase mb-1">手續費 / 其他 (USD)</div>
+                                <div className="text-xl font-mono font-bold">{fmtUSD(quote.feesUSD)}</div>
+                            </div>
+                            <div className="bg-[#1A2438] border border-[#29344E] rounded-xl p-4">
+                                <div className="text-xs font-mono text-slate-400 uppercase mb-1">關稅估計 (USD)</div>
+                                <div className="text-xl font-mono font-bold">{fmtUSD(quote.tariffUSD)}</div>
+                            </div>
+                            <div className="bg-gradient-to-br from-[#E3B341]/20 to-[#E3B341]/5 border border-[#E3B341]/50 rounded-xl p-4">
+                                <div className="text-xs font-mono text-slate-300 uppercase mb-1">無條件進位單價 (TWD／件)</div>
+                                <div className="text-2xl font-mono text-[#E3B341] font-bold">
+                                    {finalUnitCostTWD === null ? "—" : fmtTWDUnit(finalUnitCostTWD)}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="mt-4 bg-[#0D1424] border border-dashed border-[#29344E] rounded-xl p-3 text-xs font-mono text-[#3BD6A0]">
+                            <span className="text-slate-400 mr-2 uppercase">計算公式追蹤:</span> {quote.trace}
+                        </div>
+                    </div>
+
+                    {/* 歷史紀錄 */}
+                    <div className="bg-[#121A2C] border border-[#29344E] rounded-2xl p-6 shadow-xl">
+                        <h2 className="text-base font-semibold font-grotesk mb-4 text-[#E3B341]">歷史紀錄</h2>
+                        {history.length === 0 ? (
+                            <div className="text-center py-8 text-slate-500 text-sm">尚無紀錄 — 調整上方參數後點擊「加入歷史紀錄」</div>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left font-mono text-xs">
+                                    <thead>
+                                        <tr className="border-b border-[#29344E] text-slate-400">
+                                            <th className="p-3">時間</th>
+                                            <th className="p-3">廠商</th>
+                                            <th className="p-3">數量</th>
+                                            <th className="p-3">總成本(TWD)</th>
+                                            <th className="p-3 text-[#E3B341]">進位單價(TWD)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {history.map(r => {
+                                            const rFinalTWD = r.quantity > 0 ? r.totalTWD / r.quantity : 0;
+                                            return (
+                                                <tr key={r.id} className="border-b border-[#29344E]/50 hover:bg-[#1A2438]">
+                                                    <td className="p-3 text-slate-400">{r.timestamp}</td>
+                                                    <td className="p-3">{r.vendor}</td>
+                                                    <td className="p-3">{r.quantity}</td>
+                                                    <td className="p-3">{fmtTWD(r.totalTWD)}</td>
+                                                    <td className="p-3 text-[#E3B341] font-bold">{fmtTWDUnit(rFinalTWD)}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
                 </div>
-              )}
-            </div>
+            );
+        }
 
-            <div className="field">
-              <label>單位成本</label>
-              <div className="field-combo">
-                <select value={unitCostCurrency} onChange={(e) => setUnitCostCurrency(e.target.value)}>
-                  <option value="USD">USD</option>
-                  <option value="CNY">CNY</option>
-                  <option value="NTD">NTD</option>
-                </select>
-                <input 
-                  type="number" 
-                  step="0.01" 
-                  value={unitCost} 
-                  onChange={(e) => setUnitCost(e.target.value)} 
-                  placeholder="輸入單價"
-                />
-              </div>
-            </div>
-
-            <div className="field">
-              <label>採購數量</label>
-              <input
-                className="input-solo"
-                type="number"
-                value={quantity}
-                onChange={(e) => setQuantity(e.target.value)}
-              />
-            </div>
-
-            <div className="field">
-              <label>套用關稅率 (%)</label>
-              <input
-                className="input-solo"
-                type="number"
-                step="0.1"
-                placeholder="0"
-                value={manualTariffRate}
-                onChange={(e) => setManualTariffRate(e.target.value)}
-              />
-            </div>
-
-            <div className="field">
-              <button className="btn btn-primary add-history-btn" onClick={handleAddHistory}>
-                <Plus size={15} /> 加入歷史紀錄
-              </button>
-              {cloudWriteSentAt && (
-                <div className="rate-meta" style={{ marginTop: 6 }}>
-                  已送出至雲端 Sheet（{cloudWriteSentAt}）· 如需確認請直接查看「採購歷史紀錄」分頁
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
-
-        {/* 料號分類 → 關稅率估算 */}
-        <section className="card">
-          <div className="import-row" style={{ marginBottom: 6 }}>
-            <div className="card-title" style={{ marginBottom: 0 }}>
-              料號輔助分類 (智能估算關稅率)
-            </div>
-            <button className="btn btn-ghost btn-sm" onClick={() => setShowApiKeyInput((s) => !s)}>
-              {showApiKeyInput ? "隱藏 API 金鑰設定" : "設定 Mouser API 金鑰 (選填)"}
-            </button>
-          </div>
-
-          {showApiKeyInput && (
-            <div className="field" style={{ marginBottom: 14 }}>
-              <label>Mouser Developer API 金鑰</label>
-              <input
-                className="input-solo"
-                type="password"
-                placeholder="貼上你申請到的 Mouser Search API 金鑰"
-                value={mouserApiKey}
-                onChange={(e) => setMouserApiKey(e.target.value)}
-              />
-              <div className="rate-meta" style={{ marginTop: 6 }}>
-                未設定金鑰時，會自動改用本地關鍵字比對（比對料號是否包含 RELAY／FUSE 等字眼）。
-              </div>
-            </div>
-          )}
-
-          <div className="controls-grid" style={{ gridTemplateColumns: "2fr 1fr" }}>
-            <div className="field">
-              <label>料號 (Part Number)</label>
-              <input
-                className="input-solo"
-                type="text"
-                placeholder="輸入零件料號，例如 G5V-2-H1"
-                value={partNumber}
-                onChange={(e) => setPartNumber(e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <button className="btn btn-primary" onClick={handleLookupTariff} disabled={tariffLookupLoading || !partNumber.trim()}>
-                <RefreshCw size={14} className={tariffLookupLoading ? "spin" : ""} />
-                {tariffLookupLoading ? "查詢中…" : "查詢分類並套用稅率"}
-              </button>
-            </div>
-          </div>
-
-          {tariffLookupError && <div className="error-banner" style={{ marginTop: 12 }}>{tariffLookupError}</div>}
-
-          {tariffResult && (
-            <div className="trace-strip" style={{ marginTop: 14, color: tariffResult.rate > 0 ? "var(--gold)" : "var(--teal)" }}>
-              <span className="trace-tag">分類結果</span>
-              {tariffResult.category ? "Mouser 分類：" + tariffResult.category + " · " : ""}
-              已自動套用關稅率 <strong>{tariffResult.rate}%</strong>
-              {" "}
-              <span style={{ color: "var(--text-dim)" }}>（來源：{tariffResult.source}）</span>
-            </div>
-          )}
-        </section>
-
-        {/* 數據面板 */}
-        <section className="card">
-          <div className="card-title">試算結果</div>
-          <div className="panel-grid">
-            <div className="stat ship">
-              <div className="stat-label">預估運費 (USD)</div>
-              <div className="stat-value">{fmtUSD(quote.shippingUSD)}</div>
-            </div>
-
-            {hasHandlingFee && (
-              <div className="stat">
-                <div className="stat-label">各項手續費用 (USD)</div>
-                <div className="stat-value">{fmtUSD(quote.feesUSD)}</div>
-              </div>
-            )}
-
-            <div className="stat">
-              <div className="stat-label">關稅估計 (USD)</div>
-              <div className="stat-value">{fmtUSD(quote.tariffUSD)}</div>
-            </div>
-
-            <div className="stat total">
-              <div className="stat-label">無條件進位單價 (TWD／件)</div>
-              <div className="stat-value">
-                {finalUnitCostTWD === null ? "—" : fmtTWDUnit(finalUnitCostTWD)}
-              </div>
-            </div>
-          </div>
-
-          <div className="trace-strip">
-            <span className="trace-tag">I 欄公式</span>
-            {quote.trace}
-          </div>
-        </section>
-
-        {/* 歷史紀錄 */}
-        <section className="card">
-          <div className="import-row" style={{ marginBottom: 16 }}>
-            <div className="card-title" style={{ marginBottom: 0 }}>歷史紀錄</div>
-            {history.length > 0 && (
-              <button className="btn btn-ghost btn-sm" onClick={handleExportHistory}>
-                <Download size={14} /> 匯出歷史紀錄 (Excel)
-              </button>
-            )}
-          </div>
-          
-          {history.length === 0 ? (
-            <div className="empty-state">尚無紀錄 — 調整上方參數後點擊「加入歷史紀錄」即會顯示在這裡</div>
-          ) : (
-            <div className="history-table-wrap">
-              <table className="history">
-                <thead>
-                  <tr>
-                    <th>時間</th>
-                    <th>廠商</th>
-                    <th>計價匯率</th>
-                    <th>單位成本</th>
-                    <th>數量</th>
-                    <th>小計(USD)</th>
-                    <th>運費(USD)</th>
-                    <th>手續費(USD)</th>
-                    <th>關稅(USD)</th>
-                    <th>總成本(TWD)</th>
-                    <th>進位單價(TWD)</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.map((r) => {
-                    const rFinalTWD = r.quantity > 0 ? r.totalTWD / r.quantity : 0;
-                    return (
-                      <tr key={r.id}>
-                        <td>{r.timestamp}</td>
-                        <td>{r.vendor}</td>
-                        <td>{r.exchangeCurrency} {r.exchangeRate}</td>
-                        <td>{r.unitCostCurrency} {r.unitCost}</td>
-                        <td>{r.quantity}</td>
-                        <td>{fmtUSD(r.subtotalUSD)}</td>
-                        <td>{fmtUSD(r.shippingUSD)}</td>
-                        <td>{fmtUSD(r.feesUSD)}</td>
-                        <td>{fmtUSD(r.tariffUSD)}</td>
-                        <td className="total-cell">{fmtTWD(r.totalTWD)}</td>
-                        <td className="total-cell">{fmtTWDUnit(rFinalTWD)}</td>
-                        <td>
-                          <button className="del-btn" onClick={() => handleDeleteHistory(r.id)}>
-                            <Trash2 size={14} />
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      </div>
-    </div>
-  );
-}
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>

@@ -319,8 +319,9 @@ Error generating stack: `+i.message+`
 
         .sheet-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
         .sheet-table th, .sheet-table td { padding: 9px 10px; border: 1px solid var(--border); text-align: left; white-space: nowrap; }
-        .sheet-table thead tr:first-child th { background: var(--panel-raised); color: var(--gold); font-weight: 600; }
-        .sheet-table thead tr:last-child th { color: var(--text-dim); font-weight: 500; }
+        .sheet-table thead th { position: sticky; z-index: 1; }
+        .sheet-table thead tr:first-child th { top: 0; background: var(--panel-raised); color: var(--gold); font-weight: 600; }
+        .sheet-table thead tr:last-child th { top: 34px; background: var(--panel-raised); color: var(--text-dim); font-weight: 500; }
         .sheet-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
         .sheet-table tbody tr:hover { background: rgba(227,179,65,0.06); }
 
@@ -384,9 +385,9 @@ Error generating stack: `+i.message+`
           color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 8px;
         }
 
-        .history-table-wrap { overflow-x: auto; }
+        .history-table-wrap { overflow-x: auto; overflow-y: auto; max-height: 420px; }
         table.history { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1350px; }
-        table.history th { text-align: left; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+        table.history th { position: sticky; top: 0; z-index: 1; text-align: left; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-weight: 500; background: var(--panel); }
         table.history td { padding: 11px 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; }
         table.history tbody tr:hover { background: var(--panel-raised); }
         table.history td.total-cell { color: var(--gold); font-weight: 600; }
